@@ -2,88 +2,221 @@ import os
 import shutil
 import subprocess
 import tempfile
+import uuid
 from pathlib import Path
+from typing import Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 
-app = FastAPI(title="MozTools Documents Engine", version="1.0.0")
+app = FastAPI(title="MozTools Documents Engine")
 
-MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "50"))
-TIMEOUT_SECONDS = int(os.getenv("CONVERSION_TIMEOUT_SECONDS", "120"))
+# ------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------
+LIBREOFFICE_BIN = "libreoffice"
+TEMP_ROOT = Path(tempfile.gettempdir()) / "moztools-engine"
+TEMP_ROOT.mkdir(parents=True, exist_ok=True)
 
-# LibreOffice handles common office/document conversions.
-SUPPORTED_OUTPUTS = {
-    "pdf", "docx", "odt", "rtf", "txt", "html",
-    "xlsx", "xls", "csv", "pptx", "odp", "ppt"
+OUTPUT_FORMATS = [
+    "csv", "docx", "html", "odp", "odt", "pdf",
+    "ppt", "pptx", "rtf", "txt", "xls", "xlsx"
+]
+
+LIBREOFFICE_FORMATS = {
+    "csv", "html", "odp", "odt", "pdf",
+    "ppt", "pptx", "rtf", "txt", "xls", "xlsx"
 }
 
+
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+def cleanup_dir(path: Optional[Path]) -> None:
+    if path is None:
+        return
+    try:
+        shutil.rmtree(path, ignore_errors=True)
+    except Exception:
+        pass
+
+
+def unique_workdir() -> Path:
+    workdir = TEMP_ROOT / uuid.uuid4().hex
+    workdir.mkdir(parents=True, exist_ok=True)
+    return workdir
+
+
+def convert_with_libreoffice(input_path: Path, output_dir: Path, target_format: str) -> Path:
+    cmd = [
+        LIBREOFFICE_BIN,
+        "--headless",
+        "--norestore",
+        "--convert-to",
+        target_format,
+        "--outdir",
+        str(output_dir),
+        str(input_path),
+    ]
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=120,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(
+            status_code=504,
+            detail="Conversion timed out. The file may be too large or too complex.",
+        )
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=500,
+            detail="LibreOffice is not available on the server.",
+        )
+
+    expected = output_dir / f"{input_path.stem}.{target_format}"
+    if expected.exists():
+        return expected
+
+    matches = list(output_dir.glob(f"*.{target_format}"))
+    if matches:
+        return matches[0]
+
+    stderr = proc.stderr.decode("utf-8", errors="replace").strip()
+    raise HTTPException(
+        status_code=500,
+        detail=f"LibreOffice could not produce a {target_format} file. {stderr}",
+    )
+
+
+def convert_pdf_to_docx(input_path: Path, output_path: Path) -> Path:
+    try:
+        from pdf2docx import Converter
+    except ImportError:
+        raise HTTPException(
+            status_code=500,
+            detail="pdf2docx is not installed on the server.",
+        )
+
+    try:
+        cv = Converter(str(input_path))
+        cv.convert(str(output_path))
+        cv.close()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"PDF to DOCX conversion failed: {exc}",
+        )
+
+    if not output_path.exists():
+        raise HTTPException(
+            status_code=500,
+            detail="PDF to DOCX conversion did not produce an output file.",
+        )
+
+    return output_path
+
+
+# ------------------------------------------------------------
+# Existing endpoints (unchanged)
+# ------------------------------------------------------------
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "moztools-documents-engine"}
 
+
 @app.get("/formats")
 def formats():
     return {
-        "output_formats": sorted(SUPPORTED_OUTPUTS),
-        "note": "Actual conversions depend on the input file and LibreOffice support."
+        "output_formats": OUTPUT_FORMATS,
+        "note": "Actual conversions depend on the input file and LibreOffice support.",
     }
 
+
+# ------------------------------------------------------------
+# Conversion endpoint
+# ------------------------------------------------------------
 @app.post("/convert")
 async def convert(
     file: UploadFile = File(...),
-    output_format: str = Form(...)
+    output_format: str = Form(...),
 ):
-    output_format = output_format.lower().strip().lstrip(".")
-    if output_format not in SUPPORTED_OUTPUTS:
-        raise HTTPException(status_code=400, detail="Unsupported output format.")
+    output_format = output_format.lower().strip()
 
-    original_name = Path(file.filename or "upload").name
-    input_suffix = Path(original_name).suffix.lower()
-    if not input_suffix:
-        raise HTTPException(status_code=400, detail="The uploaded file must have an extension.")
+    if output_format not in OUTPUT_FORMATS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported output format: {output_format}",
+        )
 
-    workdir = Path(tempfile.mkdtemp(prefix="moztools-"))
+    original_name = file.filename or "input"
+    suffix = Path(original_name).suffix.lower()
+
+    workdir = unique_workdir()
+    input_path = workdir / f"input{suffix}"
+    output_dir = workdir / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     try:
-        input_path = workdir / f"input{input_suffix}"
-        output_dir = workdir / "output"
-        output_dir.mkdir()
+        with input_path.open("wb") as buffer:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                buffer.write(chunk)
+    except Exception as exc:
+        cleanup_dir(workdir)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not save uploaded file: {exc}",
+        )
 
-        size = 0
-        with input_path.open("wb") as target:
-            while chunk := await file.read(1024 * 1024):
-                size += len(chunk)
-                if size > MAX_UPLOAD_MB * 1024 * 1024:
-                    raise HTTPException(status_code=413, detail=f"Maximum upload size is {MAX_UPLOAD_MB} MB.")
-                target.write(chunk)
+    produced_path: Optional[Path] = None
 
-        command = [
-            "soffice", "--headless", "--nologo", "--nodefault",
-            "--nolockcheck", "--convert-to", output_format,
-            "--outdir", str(output_dir), str(input_path)
-        ]
-        try:
-            result = subprocess.run(
-                command, capture_output=True, text=True,
-                timeout=TIMEOUT_SECONDS, check=False
+    try:
+        if suffix == ".pdf" and output_format == "docx":
+            produced_path = output_dir / "result.docx"
+            convert_pdf_to_docx(input_path, produced_path)
+
+        elif output_format in LIBREOFFICE_FORMATS:
+            produced_path = convert_with_libreoffice(
+                input_path=input_path,
+                output_dir=output_dir,
+                target_format=output_format,
             )
-        except subprocess.TimeoutExpired:
-            raise HTTPException(status_code=504, detail="Conversion timed out. Try a smaller file.")
 
-        expected = output_dir / f"input.{output_format}"
-        if result.returncode != 0 or not expected.exists():
-            detail = (result.stderr or result.stdout or "This input-to-output conversion is not supported.")
-            raise HTTPException(status_code=422, detail=detail[-1200:])
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Conversion from {suffix or 'unknown'} to {output_format} is not supported by this engine yet.",
+            )
+
+        if produced_path is None or not produced_path.exists():
+            raise HTTPException(
+                status_code=500,
+                detail="Conversion finished without producing an output file.",
+            )
 
         download_name = f"{Path(original_name).stem}.{output_format}"
         return FileResponse(
-            path=str(expected),
-            filename=download_name,
+            path=str(produced_path),
             media_type="application/octet-stream",
-            background=None
+            filename=download_name,
+            background=BackgroundTask(cleanup_dir, workdir),
         )
-    finally:
-        # FileResponse streams after this endpoint returns, so don't remove
-        # the temporary directory here. The container's periodic cleanup
-        # or host lifecycle should remove it; see README for production notes.
-        pass
+
+    except HTTPException:
+        cleanup_dir(workdir)
+        raise
+
+    except Exception as exc:
+        cleanup_dir(workdir)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected conversion error: {exc}",
+        )
