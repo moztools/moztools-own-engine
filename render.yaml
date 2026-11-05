@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: moztools-own-engine
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: MAX_UPLOAD_MB
+        value: "50"
+      - key: CONVERSION_TIMEOUT_SECONDS
+        value: "120"
