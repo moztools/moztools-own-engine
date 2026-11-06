@@ -19,6 +19,11 @@ LIBREOFFICE_BIN = "libreoffice"
 TEMP_ROOT = Path(tempfile.gettempdir()) / "moztools-engine"
 TEMP_ROOT.mkdir(parents=True, exist_ok=True)
 
+# Free-tier safety limits for pdf2docx.
+# pdf2docx uses a lot of RAM; on Render Free (512 MB) larger PDFs crash the instance.
+PDF_TO_DOCX_MAX_PAGES = 2
+PDF_TO_DOCX_MAX_BYTES = 3 * 1024 * 1024  # 3 MB
+
 OUTPUT_FORMATS = [
     "csv", "docx", "html", "odp", "odt", "pdf",
     "ppt", "pptx", "rtf", "txt", "xls", "xlsx"
@@ -94,7 +99,57 @@ def convert_with_libreoffice(input_path: Path, output_dir: Path, target_format: 
     )
 
 
+def count_pdf_pages(input_path: Path) -> int:
+    try:
+        import pymupdf
+    except ImportError:
+        try:
+            import fitz as pymupdf
+        except ImportError:
+            raise HTTPException(
+                status_code=500,
+                detail="PDF page counting library is not available on the server.",
+            )
+
+    try:
+        doc = pymupdf.open(str(input_path))
+        page_count = doc.page_count
+        doc.close()
+        return page_count
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not read the PDF file: {exc}",
+        )
+
+
 def convert_pdf_to_docx(input_path: Path, output_path: Path) -> Path:
+    # Size guard first.
+    size = input_path.stat().st_size
+    if size > PDF_TO_DOCX_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                "PDF -> DOCX on the free tier supports files up to "
+                f"{PDF_TO_DOCX_MAX_BYTES // (1024 * 1024)} MB. "
+                "Please use a smaller PDF."
+            ),
+        )
+
+    # Page count guard.
+    pages = count_pdf_pages(input_path)
+    if pages > PDF_TO_DOCX_MAX_PAGES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                "PDF -> DOCX on the free tier supports up to "
+                f"{PDF_TO_DOCX_MAX_PAGES} pages. "
+                "Your PDF has "
+                f"{pages} pages. Please use a smaller PDF. "
+                "Tip: DOCX -> PDF has no page limit."
+            ),
+        )
+
     try:
         from pdf2docx import Converter
     except ImportError:
