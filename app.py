@@ -4,7 +4,7 @@ import subprocess
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
@@ -12,6 +12,7 @@ from starlette.background import BackgroundTask
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="MozTools Documents Engine")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -31,10 +32,14 @@ LIBREOFFICE_BIN = "libreoffice"
 TEMP_ROOT = Path(tempfile.gettempdir()) / "moztools-engine"
 TEMP_ROOT.mkdir(parents=True, exist_ok=True)
 
-# Free-tier safety limits for pdf2docx.
-# pdf2docx uses a lot of RAM; on Render Free (512 MB) larger PDFs crash the instance.
+# Free-tier safety limits
 PDF_TO_DOCX_MAX_PAGES = 2
-PDF_TO_DOCX_MAX_BYTES = 3 * 1024 * 1024  # 3 MB
+PDF_TO_DOCX_MAX_BYTES = 3 * 1024 * 1024       # 3 MB
+
+IMAGE_TO_PDF_MAX_BYTES = 3 * 1024 * 1024      # 3 MB per image
+IMAGE_TO_PDF_MAX_IMAGES = 5                   # max 5 images per conversion
+
+MERGE_PDF_MAX_FILES = 5                       # max 5 PDFs per merge
 
 OUTPUT_FORMATS = [
     "csv", "docx", "html", "odp", "odt", "pdf",
@@ -45,6 +50,8 @@ LIBREOFFICE_FORMATS = {
     "csv", "html", "odp", "odt", "pdf",
     "ppt", "pptx", "rtf", "txt", "xls", "xlsx"
 }
+
+ALLOWED_IMAGE_EXT = {".jpg", ".jpeg", ".png"}
 
 
 # ------------------------------------------------------------
@@ -136,7 +143,6 @@ def count_pdf_pages(input_path: Path) -> int:
 
 
 def convert_pdf_to_docx(input_path: Path, output_path: Path) -> Path:
-    # Size guard first.
     size = input_path.stat().st_size
     if size > PDF_TO_DOCX_MAX_BYTES:
         raise HTTPException(
@@ -148,7 +154,6 @@ def convert_pdf_to_docx(input_path: Path, output_path: Path) -> Path:
             ),
         )
 
-    # Page count guard.
     pages = count_pdf_pages(input_path)
     if pages > PDF_TO_DOCX_MAX_PAGES:
         raise HTTPException(
@@ -190,6 +195,116 @@ def convert_pdf_to_docx(input_path: Path, output_path: Path) -> Path:
 
 
 # ------------------------------------------------------------
+# NEW: image -> PDF (JPG / JPEG / PNG) using pymupdf
+# ------------------------------------------------------------
+def images_to_pdf(image_paths: List[Path], output_path: Path) -> Path:
+    try:
+        import pymupdf
+    except ImportError:
+        try:
+            import fitz as pymupdf
+        except ImportError:
+            raise HTTPException(
+                status_code=500,
+                detail="PDF library is not available on the server.",
+            )
+
+    try:
+        doc = pymupdf.open()
+
+        for img_path in image_paths:
+            img_bytes = img_path.read_bytes()
+
+            # pymupdf can insert from bytes; it detects the image type.
+            img = pymupdf.open(stream=img_bytes, filetype=img_path.suffix.lstrip(".").lower())
+
+            rect = img[0].rect
+            pdf_bytes = img.convert_to_pdf()
+            pdf_page = pymupdf.open("pdf", pdf_bytes)
+
+            doc.insert_pdf(pdf_page)
+
+            pdf_page.close()
+            img.close()
+
+        if doc.page_count == 0:
+            doc.close()
+            raise HTTPException(
+                status_code=400,
+                detail="No valid images were found to convert.",
+            )
+
+        doc.save(str(output_path))
+        doc.close()
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Image to PDF conversion failed: {exc}",
+        )
+
+    if not output_path.exists():
+        raise HTTPException(
+            status_code=500,
+            detail="Image to PDF conversion did not produce an output file.",
+        )
+
+    return output_path
+
+
+# ------------------------------------------------------------
+# NEW: merge multiple PDFs into one using pymupdf
+# ------------------------------------------------------------
+def merge_pdfs(pdf_paths: List[Path], output_path: Path) -> Path:
+    try:
+        import pymupdf
+    except ImportError:
+        try:
+            import fitz as pymupdf
+        except ImportError:
+            raise HTTPException(
+                status_code=500,
+                detail="PDF library is not available on the server.",
+            )
+
+    try:
+        merged = pymupdf.open()
+
+        for pdf_path in pdf_paths:
+            src = pymupdf.open(str(pdf_path))
+            merged.insert_pdf(src)
+            src.close()
+
+        if merged.page_count == 0:
+            merged.close()
+            raise HTTPException(
+                status_code=400,
+                detail="The uploaded PDFs have no pages.",
+            )
+
+        merged.save(str(output_path))
+        merged.close()
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"PDF merge failed: {exc}",
+        )
+
+    if not output_path.exists():
+        raise HTTPException(
+            status_code=500,
+            detail="PDF merge did not produce an output file.",
+        )
+
+    return output_path
+
+
+# ------------------------------------------------------------
 # Existing endpoints (unchanged)
 # ------------------------------------------------------------
 @app.get("/health")
@@ -202,11 +317,12 @@ def formats():
     return {
         "output_formats": OUTPUT_FORMATS,
         "note": "Actual conversions depend on the input file and LibreOffice support.",
+        "special": ["image->pdf", "merge-pdf"],
     }
 
 
 # ------------------------------------------------------------
-# Conversion endpoint
+# Existing convert endpoint (unchanged)
 # ------------------------------------------------------------
 @app.post("/convert")
 async def convert(
@@ -286,4 +402,157 @@ async def convert(
         raise HTTPException(
             status_code=500,
             detail=f"Unexpected conversion error: {exc}",
+        )
+
+
+# ------------------------------------------------------------
+# NEW endpoint: image -> PDF
+# ------------------------------------------------------------
+@app.post("/convert-image")
+async def convert_image(
+    files: List[UploadFile] = File(...),
+):
+    if not files:
+        raise HTTPException(status_code=400, detail="No images were uploaded.")
+
+    if len(files) > IMAGE_TO_PDF_MAX_IMAGES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Image -> PDF on the free tier supports up to "
+                f"{IMAGE_TO_PDF_MAX_IMAGES} images per conversion. "
+                f"You uploaded {len(files)}."
+            ),
+        )
+
+    workdir = unique_workdir()
+    image_paths: List[Path] = []
+    output_path = workdir / "result.pdf"
+
+    try:
+        for idx, upload in enumerate(files):
+            name = upload.filename or f"image{idx}"
+            suffix = Path(name).suffix.lower()
+
+            if suffix not in ALLOWED_IMAGE_EXT:
+                cleanup_dir(workdir)
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Only JPG, JPEG and PNG images are supported. Got: {suffix or 'unknown'}.",
+                )
+
+            target = workdir / f"img_{idx}{suffix}"
+
+            with target.open("wb") as buffer:
+                while True:
+                    chunk = await upload.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    buffer.write(chunk)
+
+            if target.stat().st_size > IMAGE_TO_PDF_MAX_BYTES:
+                cleanup_dir(workdir)
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"Each image must be up to "
+                        f"{IMAGE_TO_PDF_MAX_BYTES // (1024 * 1024)} MB on the free tier. "
+                        f"{name} is larger."
+                    ),
+                )
+
+            image_paths.append(target)
+
+        images_to_pdf(image_paths, output_path)
+
+        return FileResponse(
+            path=str(output_path),
+            media_type="application/pdf",
+            filename="moztools-images.pdf",
+            background=BackgroundTask(cleanup_dir, workdir),
+        )
+
+    except HTTPException:
+        cleanup_dir(workdir)
+        raise
+
+    except Exception as exc:
+        cleanup_dir(workdir)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected image conversion error: {exc}",
+        )
+
+
+# ------------------------------------------------------------
+# NEW endpoint: merge PDFs
+# ------------------------------------------------------------
+@app.post("/merge-pdf")
+async def merge_pdf(
+    files: List[UploadFile] = File(...),
+):
+    if not files:
+        raise HTTPException(status_code=400, detail="No PDFs were uploaded.")
+
+    if len(files) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="Merging requires at least 2 PDF files.",
+        )
+
+    if len(files) > MERGE_PDF_MAX_FILES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Merging on the free tier supports up to "
+                f"{MERGE_PDF_MAX_FILES} PDFs per merge. "
+                f"You uploaded {len(files)}."
+            ),
+        )
+
+    workdir = unique_workdir()
+    pdf_paths: List[Path] = []
+    output_path = workdir / "merged.pdf"
+
+    try:
+        for idx, upload in enumerate(files):
+            name = upload.filename or f"file{idx}"
+            suffix = Path(name).suffix.lower()
+
+            if suffix != ".pdf":
+                cleanup_dir(workdir)
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Only PDF files can be merged. Got: {suffix or 'unknown'}.",
+                )
+
+            target = workdir / f"doc_{idx}.pdf"
+
+            with target.open("wb") as buffer:
+                while True:
+                    chunk = await upload.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    buffer.write(chunk)
+
+            pdf_paths.append(target)
+
+        merge_pdfs(pdf_paths, output_path)
+
+        return FileResponse(
+            path=str(output_path),
+            media_type="application/pdf",
+            filename="moztools-merged.pdf",
+            background=BackgroundTask(cleanup_dir, workdir),
+        )
+
+    except HTTPException:
+        cleanup_dir(workdir)
+        raise
+
+    except Exception as exc:
+        cleanup_dir(workdir)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected merge error: {exc}",
         )
