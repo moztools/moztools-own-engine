@@ -9,8 +9,20 @@ from typing import Optional
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="MozTools Documents Engine")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://moztools.github.io",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+    ],
+    allow_credentials=False,
+    allow_methods=["POST", "GET"],
+    allow_headers=["*"],
+)
 
 # ------------------------------------------------------------
 # Configuration
